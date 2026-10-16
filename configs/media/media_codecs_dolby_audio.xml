@@ -53,4 +53,27 @@
         </MediaCodec>
         <!-- DOLBY_UDC END -->
     </Decoders>
+    <Encoders>
+        <!-- LDAC: high-bitrate Bluetooth audio for Nothing Phone 2 (Snapdragon 8+ Gen 1) -->
+        <MediaCodec name="c2.ldac.encoder" type="audio/ldac">
+            <Limit name="channel-count" max="2" />
+            <Limit name="sample-rate" ranges="44100,48000,88200,96000" />
+            <Limit name="bitrate" range="330000-990000" />
+            <Attribute name="software-codec" />
+        </MediaCodec>
+        <!-- aptX Adaptive: dynamic bitrate BT codec for Nothing Phone 2 -->
+        <MediaCodec name="c2.qti.avd.encoder" type="audio/aptx-adaptive">
+            <Limit name="channel-count" max="2" />
+            <Limit name="sample-rate" ranges="44100,48000,96000" />
+            <Limit name="bitrate" range="279000-420000" />
+            <Attribute name="software-codec" />
+        </MediaCodec>
+        <!-- LC3: low-latency BT codec for LE Audio (CMF Buds 2 support) -->
+        <MediaCodec name="c2.lc3.encoder" type="audio/lc3">
+            <Limit name="channel-count" max="2" />
+            <Limit name="sample-rate" ranges="8000,16000,24000,32000,48000" />
+            <Limit name="bitrate" range="16000-400000" />
+            <Attribute name="software-codec" />
+        </MediaCodec>
+    </Encoders>
 </Included>

@@ -51,6 +51,103 @@ class DeviceStateManager(private val context: Context) {
         }
     }
 
+    data class DeviceEqPreset(
+        val name: String,
+        val tenBandGains: IntArray,
+        val ieqPreset: Int = 0,
+        val bassLevel: Int = 0,
+        val trebleLevel: Int = 0,
+        val dialogueLevel: Int = 0
+    ) {
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (other !is DeviceEqPreset) return false
+            return name == other.name && tenBandGains.contentEquals(other.tenBandGains)
+        }
+
+        override fun hashCode(): Int = 31 * name.hashCode() + tenBandGains.contentHashCode()
+    }
+
+    fun getDeviceEqPreset(device: AudioDeviceInfo): DeviceEqPreset? {
+        val name = device.productName?.toString()?.lowercase() ?: ""
+        val addr = device.address?.lowercase() ?: ""
+
+        return when {
+            name.contains("buds 2") || name.contains("cmf buds") ->
+                DeviceEqPreset(
+                    name = "CMF Buds 2",
+                    tenBandGains = intArrayOf(4, 3, 2, 1, 0, -1, 1, 3, 4, 3),
+                    ieqPreset = 2,
+                    bassLevel = 20,
+                    trebleLevel = 15
+                )
+            name.contains("nothing ear") || name.contains("nothing ear (a)") ->
+                DeviceEqPreset(
+                    name = "Nothing Ear",
+                    tenBandGains = intArrayOf(3, 2, 1, 0, -1, 0, 2, 3, 3, 2),
+                    ieqPreset = 2,
+                    bassLevel = 15,
+                    trebleLevel = 10
+                )
+            device.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER ->
+                DeviceEqPreset(
+                    name = "Phone Speaker",
+                    tenBandGains = intArrayOf(5, 4, 2, 0, -2, -1, 1, 3, 4, 4),
+                    ieqPreset = 1,
+                    bassLevel = 25
+                )
+            device.type == AudioDeviceInfo.TYPE_USB_DEVICE ||
+            device.type == AudioDeviceInfo.TYPE_USB_HEADSET ->
+                DeviceEqPreset(
+                    name = "USB DAC",
+                    tenBandGains = intArrayOf(0, 0, 0, 0, 0, 0, 0, 1, 1, 1),
+                    ieqPreset = 0
+                )
+            else -> null
+        }
+    }
+
+    fun applyGameMode(repository: DolbyRepository) {
+        val profile = repository.getCurrentProfile()
+        // Game: punchy bass, slightly lifted mids, tighter treble for footsteps
+        val gameGains = intArrayOf(6, 5, 3, 1, -1, 0, 2, 4, 5, 4)
+        val bandGains = gameGains.mapIndexed { i, g ->
+            BandGain(frequency = DolbyRepository.BAND_FREQUENCIES_10[i], gain = g)
+        }
+        repository.setEqualizerGains(profile, bandGains, BandMode.TEN_BAND)
+        repository.setBassEnhancerEnabled(profile, true)
+        repository.setBassLevel(profile, 35)
+        repository.setVolumeLevelerEnabled(profile, true)
+        repository.setStereoWideningAmount(profile, 40)
+        repository.setHeadphoneVirtualizerEnabled(profile, true)
+        repository.setDialogueEnhancerAmount(profile, 8)
+        DolbyConstants.dlog(TAG, "Game mode applied for profile $profile")
+    }
+
+    fun applySpeakerVirtualizer(repository: DolbyRepository, enabled: Boolean) {
+        val profile = repository.getCurrentProfile()
+        repository.setSpeakerVirtualizerEnabled(profile, enabled)
+        if (enabled) {
+            repository.setStereoWideningAmount(profile, 35)
+        }
+        DolbyConstants.dlog(TAG, "Speaker virtualizer $enabled for profile $profile")
+    }
+
+    fun applyDeviceEqPreset(device: AudioDeviceInfo, repository: DolbyRepository): Boolean {
+        val preset = getDeviceEqPreset(device) ?: return false
+        val profile = repository.getCurrentProfile()
+        val bandGains = preset.tenBandGains.mapIndexed { i, g ->
+            BandGain(frequency = DolbyRepository.BAND_FREQUENCIES_10[i], gain = g)
+        }
+        repository.setEqualizerGains(profile, bandGains, BandMode.TEN_BAND)
+        repository.setIeqPreset(profile, preset.ieqPreset)
+        if (preset.bassLevel > 0) repository.setBassLevel(profile, preset.bassLevel)
+        if (preset.trebleLevel > 0) repository.setTrebleLevel(profile, preset.trebleLevel)
+        if (preset.dialogueLevel > 0) repository.setDialogueEnhancerAmount(profile, preset.dialogueLevel)
+        DolbyConstants.dlog(TAG, "Applied EQ preset: ${preset.name} for profile $profile")
+        return true
+    }
+
     fun saveSnapshot(deviceKey: String, repository: DolbyRepository) {
         val profile = repository.getCurrentProfile()
         val prefs = getDevicePrefs(deviceKey)

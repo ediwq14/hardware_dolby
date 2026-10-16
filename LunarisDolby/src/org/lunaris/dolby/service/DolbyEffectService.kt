@@ -14,6 +14,7 @@ import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.media.AudioPlaybackConfiguration
 import android.os.Handler
+import android.os.HandlerThread
 import android.content.SharedPreferences
 import android.os.IBinder
 import android.util.Log
@@ -30,26 +31,69 @@ class DolbyEffectService : Service() {
     private val isDeviceStateMemoryEnabled: Boolean
         get() = dolbyPrefs.getBoolean(DolbyConstants.PREF_DEVICE_STATE_MEMORY, false)
     private val handler = Handler()
+    private var bgThread: HandlerThread? = null
+    private var bgHandler: Handler? = null
     private lateinit var repository: DolbyRepository
     private lateinit var deviceStateManager: DeviceStateManager
-    private var previousActiveDevice: AudioDeviceInfo? = null
+    @Volatile private var previousActiveDevice: AudioDeviceInfo? = null
+    private var appProfileManager: AppProfileManager? = null
+
+    // A single DSP re-apply is ~10 Binder round-trips. Without debouncing,
+    // one song change fires a burst of onPlaybackConfigChanged and each one
+    // re-programs DAP mid-playback -> audible pop. Same for BT connect bursts
+    // (added+removed in quick succession). Coalesce them into one delayed run
+    // on a background thread so the audio thread and UI thread never block.
+    private val applyRunnable = Runnable {
+        try {
+            repository.applySavedState()
+        } catch (e: Exception) {
+            Log.w(TAG, "Debounced apply failed", e)
+        }
+    }
+    private val deviceChangeRunnable = Runnable {
+        try {
+            handleDeviceChange()
+        } catch (e: Exception) {
+            Log.w(TAG, "Debounced device change failed", e)
+        }
+    }
+
+    private fun scheduleApply(delayMs: Long = APPLY_DEBOUNCE_MS) {
+        val h = bgHandler ?: return
+        h.removeCallbacks(applyRunnable)
+        h.postDelayed(applyRunnable, delayMs)
+    }
+
+    private fun scheduleDeviceChange(delayMs: Long = DEVICE_DEBOUNCE_MS) {
+        val h = bgHandler ?: return
+        h.removeCallbacks(deviceChangeRunnable)
+        h.postDelayed(deviceChangeRunnable, delayMs)
+    }
 
     private val audioDeviceCallback = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<AudioDeviceInfo>) {
             Log.d(TAG, "Devices added: ${addedDevices.map { it.debugString() }}")
-            handleDeviceChange()
+            scheduleDeviceChange()
         }
 
         override fun onAudioDevicesRemoved(removedDevices: Array<AudioDeviceInfo>) {
             Log.d(TAG, "Devices removed: ${removedDevices.map { it.debugString() }}")
             if (isDeviceStateMemoryEnabled) {
-                removedDevices.forEach { device ->
-                    val key = deviceStateManager.deviceKey(device)
-                    Log.d(TAG, "Snapshotting state for removed device: $key")
-                    deviceStateManager.saveSnapshot(key, repository)
+                // Capture cheap keys now (AudioDeviceInfo may go stale),
+                // run the expensive DSP snapshot on the bg thread.
+                val keys = removedDevices.map { deviceStateManager.deviceKey(it) }
+                bgHandler?.post {
+                    keys.forEach { key ->
+                        try {
+                            Log.d(TAG, "Snapshotting state for removed device: $key")
+                            deviceStateManager.saveSnapshot(key, repository)
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Snapshot failed for $key", e)
+                        }
+                    }
                 }
             }
-            handleDeviceChange()
+            scheduleDeviceChange()
         }
     }
 
@@ -57,27 +101,44 @@ class DolbyEffectService : Service() {
         override fun onPlaybackConfigChanged(configs: MutableList<AudioPlaybackConfiguration>?) {
             val isActive = configs?.any { it.isActive } == true
             if (isActive) {
-                repository.applySavedState()
+                // Debounced: the framework fires this in bursts on every
+                // track change; re-applying DSP synchronously here = glitch.
+                scheduleApply()
             }
         }
     }
 
     override fun onCreate() {
         super.onCreate()
+        val thread = HandlerThread("DolbyBg").also { it.start() }
+        bgThread = thread
+        bgHandler = Handler(thread.looper)
         repository = DolbyRepository(this)
         deviceStateManager = DeviceStateManager(this)
+        appProfileManager = AppProfileManager(this)
         val currentDevice = getCurrentOutputDevice()
         if (currentDevice != null) {
             previousActiveDevice = currentDevice
-            if (isDeviceStateMemoryEnabled) {
-                val key = deviceStateManager.deviceKey(currentDevice)
-                val restored = deviceStateManager.restoreSnapshot(key, repository)
-                if (!restored) repository.applySavedState()
-            } else {
-                repository.applySavedState()
+        }
+        // Heavy initial restore (~15 Binder IPCs) off the main thread:
+        // onCreate runs on the main thread and blocking it delays service
+        // start and can drop the first seconds of audio tuning.
+        bgHandler?.post {
+            try {
+                if (currentDevice != null) {
+                    if (isDeviceStateMemoryEnabled) {
+                        val key = deviceStateManager.deviceKey(currentDevice)
+                        val restored = deviceStateManager.restoreSnapshot(key, repository)
+                        if (!restored) repository.applySavedState()
+                    } else {
+                        repository.applySavedState()
+                    }
+                } else {
+                    repository.applySavedState()
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Initial apply failed", e)
             }
-        } else {
-            repository.applySavedState()
         }
 
         audioManager.registerAudioDeviceCallback(audioDeviceCallback, handler)
@@ -105,10 +166,26 @@ class DolbyEffectService : Service() {
                 if (!restored) {
                     Log.d(TAG, "First time device, applying saved state as base")
                     repository.applySavedState()
+                    // Apply per-device EQ preset on first connect
+                    bgHandler?.post {
+                        try {
+                            deviceStateManager.applyDeviceEqPreset(newDevice, repository)
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Device EQ preset failed", e)
+                        }
+                    }
                 }
             } else {
                 Log.d(TAG, "Device state memory disabled, applying saved state")
                 repository.applySavedState()
+                // Apply per-device EQ preset on every connect
+                bgHandler?.post {
+                    try {
+                        deviceStateManager.applyDeviceEqPreset(newDevice, repository)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Device EQ preset failed", e)
+                    }
+                }
             }
             previousActiveDevice = newDevice
         } else {
@@ -152,21 +229,50 @@ class DolbyEffectService : Service() {
         "name=$productName,type=$type,id=$id,address=$address,isSink=$isSink"
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        repository.applySavedState()
+        if (intent?.getBooleanExtra("game_mode", false) == true) {
+            appProfileManager?.let { mgr ->
+                if (mgr.isGameApp(intent?.getStringExtra("package") ?: "")) {
+                    bgHandler?.post {
+                        try {
+                            deviceStateManager.applyGameMode(repository)
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Game mode apply failed", e)
+                        }
+                    }
+                }
+            }
+        } else {
+            scheduleApply(0L)
+        }
         return START_STICKY
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        if (isDeviceStateMemoryEnabled) {
-            previousActiveDevice?.let { device ->
-                val key = deviceStateManager.deviceKey(device)
-                deviceStateManager.saveSnapshot(key, repository)
+        try {
+            bgHandler?.removeCallbacks(applyRunnable)
+            bgHandler?.removeCallbacks(deviceChangeRunnable)
+            if (isDeviceStateMemoryEnabled) {
+                previousActiveDevice?.let { device ->
+                    val key = deviceStateManager.deviceKey(device)
+                    // Best-effort synchronous snapshot; bg thread may be gone.
+                    try {
+                        deviceStateManager.saveSnapshot(key, repository)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Final snapshot failed", e)
+                    }
+                }
             }
+            audioManager.unregisterAudioDeviceCallback(audioDeviceCallback)
+            audioManager.unregisterAudioPlaybackCallback(playbackCallback)
+        } catch (e: Exception) {
+            Log.w(TAG, "Error during destroy", e)
+        } finally {
+            handler.removeCallbacksAndMessages(null)
+            bgThread?.quitSafely()
+            bgThread = null
+            bgHandler = null
         }
-        audioManager.unregisterAudioDeviceCallback(audioDeviceCallback)
-        audioManager.unregisterAudioPlaybackCallback(playbackCallback)
-        handler.removeCallbacksAndMessages(null)
         Log.d(TAG, "Dolby effect service destroyed")
     }
 
@@ -174,6 +280,10 @@ class DolbyEffectService : Service() {
 
     companion object {
         private const val TAG = "DolbyEffectService"
+        // Long enough to coalesce framework callback bursts, short enough
+        // that retuning after a real route change is imperceptible.
+        private const val APPLY_DEBOUNCE_MS = 400L
+        private const val DEVICE_DEBOUNCE_MS = 600L
 
         private val ATTRIBUTES_MEDIA = AudioAttributes.Builder()
             .setUsage(AudioAttributes.USAGE_MEDIA)

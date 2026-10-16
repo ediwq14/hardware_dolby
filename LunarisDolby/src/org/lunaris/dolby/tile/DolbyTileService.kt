@@ -36,6 +36,13 @@ class DolbyTileService : TileService() {
         }
     }
 
+    override fun onDestroy() {
+        if (::repository.isInitialized) {
+            repository.close()
+        }
+        super.onDestroy()
+    }
+
     private fun getProfileName(): String {
         val profile = repository.getCurrentProfile()
         val profiles = resources.getStringArray(R.array.dolby_profile_entries)

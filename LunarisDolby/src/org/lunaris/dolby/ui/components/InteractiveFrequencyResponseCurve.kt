@@ -167,6 +167,7 @@ fun InteractiveFrequencyResponseCurve(
                 )
             }
             
+            if (bandGains.size <= 1) return@Canvas
             val stepX = width / (bandGains.size - 1)
             bandGains.forEachIndexed { index, _ ->
                 val x = index * stepX

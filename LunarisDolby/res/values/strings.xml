@@ -80,6 +80,8 @@
     <string name="dolby_preset_movie">Movie</string>
     <string name="dolby_preset_rb">R&amp;B</string>
     <string name="dolby_preset_vocal">Vocal Booster</string>
+    <string name="dolby_preset_podcast">Podcast</string>
+    <string name="dolby_preset_bt_earbuds">BT Earbuds</string>
     <string name="dolby_preset_custom">Custom</string>
     <string name="equalizer">Equalizer</string>
     <string name="advanced">Advanced</string>

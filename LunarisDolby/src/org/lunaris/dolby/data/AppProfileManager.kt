@@ -67,8 +67,28 @@ class AppProfileManager(private val context: Context) {
             if (value is Int) key to value else null
         }.toMap()
     }
-    
+
     fun clearAllAppProfiles() {
         prefs.edit().clear().apply()
+    }
+
+    private val gameKeywords = listOf(
+        "game", "gaming", "pubg", "codm", "fortnite", "genshin", "impact",
+        "minecraft", "roblox", "free fire", "mobile legends", "mlbb",
+        "among us", "subway surfers", "temple run", "candy crush",
+        "call of duty", "league of legends", "wild rift", "esports"
+    )
+
+    fun isGameApp(packageName: String): Boolean {
+        val lower = packageName.lowercase()
+        return gameKeywords.any { keyword -> lower.contains(keyword) }
+    }
+
+    fun getGameProfile(): Int {
+        return prefs.getInt("game_profile", 3)
+    }
+
+    fun setGameProfile(profile: Int) {
+        prefs.edit().putInt("game_profile", profile).apply()
     }
 }

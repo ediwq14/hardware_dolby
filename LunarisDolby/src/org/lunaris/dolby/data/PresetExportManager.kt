@@ -166,7 +166,8 @@ class PresetExportManager(private val context: Context) {
         withContext(Dispatchers.IO) {
             try {
                 val json = exportPresetToJson(preset)
-                val fileName = "${preset.name.replace(" ", "_")}_${preset.bandMode.value}band$FILE_EXTENSION"
+                val sanitizedName = preset.name.replace(Regex("[^a-zA-Z0-9_-]"), "_")
+                val fileName = "${sanitizedName}_${preset.bandMode.value}band$FILE_EXTENSION"
                 val cacheDir = File(context.cacheDir, "shared_presets")
                 cacheDir.mkdirs()
                 val file = File(cacheDir, fileName)

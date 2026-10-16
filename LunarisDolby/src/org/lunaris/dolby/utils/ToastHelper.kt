@@ -12,13 +12,14 @@ import android.widget.Toast
 
 object ToastHelper {
     private val mainHandler = Handler(Looper.getMainLooper())
-    private var currentToast: Toast? = null
-    
+    private var currentToast: WeakReference<Toast>? = null
+
     fun showToast(context: Context, message: String, duration: Int = Toast.LENGTH_SHORT) {
         mainHandler.post {
-            currentToast?.cancel()
-            currentToast = Toast.makeText(context, message, duration)
-            currentToast?.show()
+            currentToast?.get()?.cancel()
+            val toast = Toast.makeText(context.applicationContext, message, duration)
+            currentToast = WeakReference(toast)
+            toast.show()
         }
     }
     

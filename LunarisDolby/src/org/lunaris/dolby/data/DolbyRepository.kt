@@ -41,6 +41,12 @@ class DolbyRepository(private val context: Context) : AutoCloseable {
     private var cachedPresets: List<EqualizerPreset>? = null
     private val presetCacheLock = Any()
 
+    // Serializes every GEQ read-modify-write (bass/mid/treble/preset/restore).
+    // Without this, two concurrent slider drags (or Service + UI racing) read
+    // the same baseline and one write clobbers the other -> drifting gains,
+    // hard-clipping at +/-150 and an audibly "smeared" EQ.
+    private val eqLock = Any()
+
     private fun createDolbyEffect(): DolbyAudioEffect {
         return try {
             DolbyAudioEffect(EFFECT_PRIORITY, audioSession = 0)
@@ -121,8 +127,20 @@ class DolbyRepository(private val context: Context) : AutoCloseable {
     }
 
     fun applySavedState() {
-    checkEffect()
+        checkEffect()
         val enabled = defaultPrefs.getBoolean(DolbyConstants.PREF_ENABLE, false)
+        // Skip the redundant DSP toggle: re-applying the same state re-sends
+        // ~10 Binder IPCs mid-playback, which is heard as a pop/glitch
+        // (e.g. on every onPlaybackConfigChanged burst). One cheap HAL read
+        // to confirm the state matches is far cheaper than a blind rewrite.
+        try {
+            if (dolbyEffect.dsOn == enabled) {
+                if (enabled) restoreSavedProfileIfNeeded()
+                return
+            }
+        } catch (e: Exception) {
+            DolbyConstants.dlog(TAG, "applySavedState: HAL query failed, forcing apply: ${e.message}")
+        }
         dolbyEffect.dsOn = enabled
         if (enabled) {
             restoreSavedProfileIfNeeded()
@@ -131,7 +149,8 @@ class DolbyRepository(private val context: Context) : AutoCloseable {
 
     private fun checkIsOnSpeaker(): Boolean {
         return try {
-            val device = audioManager.getDevicesForAttributes(ATTRIBUTES_MEDIA)[0]
+            val device = audioManager.getDevicesForAttributes(ATTRIBUTES_MEDIA).firstOrNull()
+                ?: return false
             device.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
         } catch (e: Exception) {
             DolbyConstants.dlog(TAG, "Error checking speaker state: ${e.message}")
@@ -156,7 +175,20 @@ class DolbyRepository(private val context: Context) : AutoCloseable {
 
     fun setDolbyEnabled(enabled: Boolean) {
         if (isReleased) return
-        
+
+        // Same guard as applySavedState: toggling dsOn re-programs the whole
+        // DAP chain, heard as a click. Skip it when nothing changed.
+        if (defaultPrefs.getBoolean(DolbyConstants.PREF_ENABLE, false) == enabled) {
+            try {
+                checkEffect()
+                if (dolbyEffect.dsOn != enabled) {
+                    dolbyEffect.dsOn = enabled
+                }
+            } catch (e: Exception) {
+                DolbyConstants.dlog(TAG, "Error verifying Dolby enabled: ${e.message}")
+            }
+            return
+        }
         try {
             checkEffect()
             dolbyEffect.dsOn = enabled
@@ -196,10 +228,11 @@ class DolbyRepository(private val context: Context) : AutoCloseable {
     }
 
     private fun restoreProfilePreset(profile: Int) {
+        synchronized(eqLock) {
         try {
             val prefs = getProfilePrefs(profile)
             val savedPresetGains = prefs.getString(DolbyConstants.PREF_PRESET, null)
-            
+
             if (savedPresetGains != null) {
                 val gains = savedPresetGains.split(",").mapNotNull { it.toIntOrNull() }.toIntArray()
                 if (gains.size == 20) {
@@ -209,6 +242,7 @@ class DolbyRepository(private val context: Context) : AutoCloseable {
             }
         } catch (e: Exception) {
             DolbyConstants.dlog(TAG, "Failed to restore preset for profile $profile: ${e.message}")
+        }
         }
     }
 
@@ -270,7 +304,8 @@ class DolbyRepository(private val context: Context) : AutoCloseable {
 
     fun setBassCurve(profile: Int, curve: Int) {
         if (isReleased) return
-        
+
+        synchronized(eqLock) {
         try {
             val prefs = getProfilePrefs(profile)
             val previousCurve = prefs.getInt(DolbyConstants.PREF_BASS_CURVE, 0)
@@ -286,12 +321,13 @@ class DolbyRepository(private val context: Context) : AutoCloseable {
             applyBassCurve(modifiedGains, level, previousCurve, -1)
             applyBassCurve(modifiedGains, level, curve, 1)
             dolbyEffect.setDapParameter(DsParam.GEQ_BAND_GAINS, modifiedGains, profile)
-            
+
             val gainsString = modifiedGains.joinToString(",")
             prefs.edit().putString(DolbyConstants.PREF_PRESET, gainsString).apply()
         } catch (e: Exception) {
             DolbyConstants.dlog(TAG, "Error setting bass curve: ${e.message}")
             throw e
+        }
         }
     }
 
@@ -307,51 +343,9 @@ class DolbyRepository(private val context: Context) : AutoCloseable {
 
     fun setBassLevel(profile: Int, level: Int) {
         if (isReleased) return
-        
         DolbyConstants.dlog(TAG, "setBassLevel: profile=$profile level=$level")
-
-        if (level !in 0..100) {
-            DolbyConstants.dlog(TAG, "setBassLevel: invalid level $level")
-            throw IllegalArgumentException("Bass level must be between 0 and 100")
-        }
-        
-        try {
-            val prefs = getProfilePrefs(profile)
-            val previousLevel = prefs.getInt(DolbyConstants.PREF_BASS_LEVEL, 0)
-            
-            prefs.edit().putInt(DolbyConstants.PREF_BASS_LEVEL, level).apply()
-            
-            setBassEnhancerEnabled(profile, level > 0)
-            
-            checkEffect()
-            val currentGains = dolbyEffect.getDapParameter(DsParam.GEQ_BAND_GAINS, profile)
-            val modifiedGains = currentGains.copyOf()
-            
-            val curve = prefs.getInt(DolbyConstants.PREF_BASS_CURVE, 0)
-            if (previousLevel > 0) {
-                applyBassCurve(modifiedGains, previousLevel, curve, -1)
-            }
-
-            if (level > 0) {
-                applyBassCurve(modifiedGains, level, curve, 1)
-            }
-            dolbyEffect.setDapParameter(DsParam.GEQ_BAND_GAINS, modifiedGains, profile)
-            
-            val gainsString = modifiedGains.joinToString(",")
-            prefs.edit().putString(DolbyConstants.PREF_PRESET, gainsString).apply()
-            
-            DolbyConstants.dlog(TAG, "setBassLevel: success")
-        } catch (e: IllegalArgumentException) {
-            DolbyConstants.dlog(TAG, "setBassLevel: validation error - ${e.message}")
-            val prefs = getProfilePrefs(profile)
-            prefs.edit().putInt(DolbyConstants.PREF_BASS_LEVEL, 0).apply()
-            throw e
-        } catch (e: Exception) {
-            DolbyConstants.dlog(TAG, "setBassLevel: unexpected error - ${e.message}")
-            throw e
-        }
+        setEnhancerLevel(profile, level, 0..9, BASS_GAIN_MULTIPLIER, DolbyConstants.PREF_BASS_LEVEL, DolbyConstants.PREF_BASS)
     }
-
     fun getTrebleEnhancerEnabled(profile: Int): Boolean {
         val prefs = getProfilePrefs(profile)
         return prefs.getBoolean(DolbyConstants.PREF_TREBLE, false)
@@ -368,60 +362,9 @@ class DolbyRepository(private val context: Context) : AutoCloseable {
 
     fun setTrebleLevel(profile: Int, level: Int) {
         if (isReleased) return
-        
         DolbyConstants.dlog(TAG, "setTrebleLevel: profile=$profile level=$level")
-
-        if (level !in 0..100) {
-            DolbyConstants.dlog(TAG, "setTrebleLevel: invalid level $level")
-            throw IllegalArgumentException("Treble level must be between 0 and 100")
-        }
-
-        try {
-            val prefs = getProfilePrefs(profile)
-            val previousLevel = prefs.getInt(DolbyConstants.PREF_TREBLE_LEVEL, 0)
-
-            prefs.edit().putInt(DolbyConstants.PREF_TREBLE_LEVEL, level).apply()
-            setTrebleEnhancerEnabled(profile, level > 0)
-
-            checkEffect()
-            val currentGains = dolbyEffect.getDapParameter(DsParam.GEQ_BAND_GAINS, profile)
-            val modifiedGains = currentGains.copyOf()
-
-            if (previousLevel > 0) {
-                val previousGain = (previousLevel * TREBLE_GAIN_MULTIPLIER).toInt()
-                for (i in 14..19) {
-                    if (i < modifiedGains.size) {
-                        modifiedGains[i] = (modifiedGains[i] - previousGain).coerceIn(-150, 150)
-                    }
-                }
-            }
-
-            if (level > 0) {
-                val trebleGain = (level * TREBLE_GAIN_MULTIPLIER).toInt()
-                for (i in 14..19) {
-                    if (i < modifiedGains.size) {
-                        modifiedGains[i] = (modifiedGains[i] + trebleGain).coerceIn(-150, 150)
-                    }
-                }
-            }
-
-            dolbyEffect.setDapParameter(DsParam.GEQ_BAND_GAINS, modifiedGains, profile)
-            
-            val gainsString = modifiedGains.joinToString(",")
-            prefs.edit().putString(DolbyConstants.PREF_PRESET, gainsString).apply()
-            
-            DolbyConstants.dlog(TAG, "setTrebleLevel: success")
-        } catch (e: IllegalArgumentException) {
-            DolbyConstants.dlog(TAG, "setTrebleLevel: validation error - ${e.message}")
-            val prefs = getProfilePrefs(profile)
-            prefs.edit().putInt(DolbyConstants.PREF_TREBLE_LEVEL, 0).apply()
-            throw e
-        } catch (e: Exception) {
-            DolbyConstants.dlog(TAG, "setTrebleLevel: unexpected error - ${e.message}")
-            throw e
-        }
+        setEnhancerLevel(profile, level, 14..19, TREBLE_GAIN_MULTIPLIER, DolbyConstants.PREF_TREBLE_LEVEL, DolbyConstants.PREF_TREBLE)
     }
-
     fun getVolumeLevelerEnabled(profile: Int): Boolean {
         if (!volumeLevelerSupported) return false
         return try {
@@ -441,6 +384,20 @@ class DolbyRepository(private val context: Context) : AutoCloseable {
             getProfilePrefs(profile).edit().putBoolean(DolbyConstants.PREF_VOLUME, enabled).apply()
         } catch (e: Exception) {
             DolbyConstants.dlog(TAG, "Error setting volume leveler: ${e.message}")
+        }
+    }
+
+    fun setVolumeLevelerAmount(profile: Int, amount: Int) {
+        if (!volumeLevelerSupported || isReleased) return
+        
+        try {
+            checkEffect()
+            dolbyEffect.setDapParameter(DsParam.VOLUME_LEVELER_ENABLE, true, profile)
+            // Re-apply EQ to recalibrate gains after leveler change
+            restoreProfilePreset(profile)
+            getProfilePrefs(profile).edit().putBoolean(DolbyConstants.PREF_VOLUME, true).apply()
+        } catch (e: Exception) {
+            DolbyConstants.dlog(TAG, "Error setting volume leveler amount: ${e.message}")
         }
     }
 
@@ -588,7 +545,8 @@ class DolbyRepository(private val context: Context) : AutoCloseable {
 
     fun setEqualizerGains(profile: Int, bandGains: List<BandGain>, bandMode: BandMode) {
         if (isReleased) return
-        
+
+        synchronized(eqLock) {
         try {
             checkEffect()
             val gains = serializeGains(bandGains, bandMode)
@@ -597,6 +555,7 @@ class DolbyRepository(private val context: Context) : AutoCloseable {
             getProfilePrefs(profile).edit().putString(DolbyConstants.PREF_PRESET, gainsString).apply()
         } catch (e: Exception) {
             DolbyConstants.dlog(TAG, "Error setting equalizer gains: ${e.message}")
+        }
         }
     }
 
@@ -839,57 +798,62 @@ class DolbyRepository(private val context: Context) : AutoCloseable {
 
     fun setMidLevel(profile: Int, level: Int) {
         if (isReleased) return
-        
         DolbyConstants.dlog(TAG, "setMidLevel: profile=$profile level=$level")
+        setEnhancerLevel(profile, level, 5..13, MID_GAIN_MULTIPLIER, DolbyConstants.PREF_MID_LEVEL, DolbyConstants.PREF_MID)
+    }
 
+    private fun setEnhancerLevel(
+        profile: Int,
+        level: Int,
+        bandIndices: IntRange,
+        multiplier: Float,
+        prefKey: String,
+        enablePrefKey: String
+    ) {
         if (level !in 0..100) {
-            DolbyConstants.dlog(TAG, "setMidLevel: invalid level $level")
-            throw IllegalArgumentException("Mid level must be between 0 and 100")
+            throw IllegalArgumentException("Level must be between 0 and 100")
         }
 
-        try {
-            val prefs = getProfilePrefs(profile)
-            val previousLevel = prefs.getInt(DolbyConstants.PREF_MID_LEVEL, 0)
+        synchronized(eqLock) {
+            try {
+                val prefs = getProfilePrefs(profile)
+                val previousLevel = prefs.getInt(prefKey, 0)
 
-            prefs.edit().putInt(DolbyConstants.PREF_MID_LEVEL, level).apply()
-            setMidEnhancerEnabled(profile, level > 0)
+                prefs.edit().putInt(prefKey, level).apply()
+                prefs.edit().putBoolean(enablePrefKey, level > 0).apply()
 
-            checkEffect()
-            val currentGains = dolbyEffect.getDapParameter(DsParam.GEQ_BAND_GAINS, profile)
-            val modifiedGains = currentGains.copyOf()
+                checkEffect()
+                val currentGains = dolbyEffect.getDapParameter(DsParam.GEQ_BAND_GAINS, profile)
+                val modifiedGains = currentGains.copyOf()
 
-            if (previousLevel > 0) {
-                val previousGain = (previousLevel * MID_GAIN_MULTIPLIER).toInt()
-                for (i in 5..13) {
-                    if (i < modifiedGains.size) {
-                        modifiedGains[i] = (modifiedGains[i] - previousGain).coerceIn(-150, 150)
+                if (previousLevel > 0) {
+                    val previousGain = (previousLevel * multiplier).toInt()
+                    for (i in bandIndices) {
+                        if (i < modifiedGains.size) {
+                            modifiedGains[i] = (modifiedGains[i] - previousGain).coerceIn(-150, 150)
+                        }
                     }
                 }
-            }
 
-            if (level > 0) {
-                val midGain = (level * MID_GAIN_MULTIPLIER).toInt()
-                for (i in 5..13) {
-                    if (i < modifiedGains.size) {
-                        modifiedGains[i] = (modifiedGains[i] + midGain).coerceIn(-150, 150)
+                if (level > 0) {
+                    val gain = (level * multiplier).toInt()
+                    for (i in bandIndices) {
+                        if (i < modifiedGains.size) {
+                            modifiedGains[i] = (modifiedGains[i] + gain).coerceIn(-150, 150)
+                        }
                     }
                 }
-            }
 
-            dolbyEffect.setDapParameter(DsParam.GEQ_BAND_GAINS, modifiedGains, profile)
-            
-            val gainsString = modifiedGains.joinToString(",")
-            prefs.edit().putString(DolbyConstants.PREF_PRESET, gainsString).apply()
-            
-            DolbyConstants.dlog(TAG, "setMidLevel: success")
-        } catch (e: IllegalArgumentException) {
-            DolbyConstants.dlog(TAG, "setMidLevel: validation error - ${e.message}")
-            val prefs = getProfilePrefs(profile)
-            prefs.edit().putInt(DolbyConstants.PREF_MID_LEVEL, 0).apply()
-            throw e
-        } catch (e: Exception) {
-            DolbyConstants.dlog(TAG, "setMidLevel: unexpected error - ${e.message}")
-            throw e
+                dolbyEffect.setDapParameter(DsParam.GEQ_BAND_GAINS, modifiedGains, profile)
+
+                val gainsString = modifiedGains.joinToString(",")
+                prefs.edit().putString(DolbyConstants.PREF_PRESET, gainsString).apply()
+            } catch (e: IllegalArgumentException) {
+                getProfilePrefs(profile).edit().putInt(prefKey, 0).apply()
+                throw e
+            } catch (e: Exception) {
+                throw e
+            }
         }
     }
     
@@ -913,9 +877,9 @@ class DolbyRepository(private val context: Context) : AutoCloseable {
         private const val TAG = "DolbyRepository"
         private const val EFFECT_PRIORITY = 100
         
-        private const val BASS_GAIN_MULTIPLIER = 1.4f
-        private const val MID_GAIN_MULTIPLIER = 1.3f
-        private const val TREBLE_GAIN_MULTIPLIER = 1.5f
+        private const val BASS_GAIN_MULTIPLIER = 1.2f
+        private const val MID_GAIN_MULTIPLIER = 1.1f
+        private const val TREBLE_GAIN_MULTIPLIER = 1.3f
         
         private val ATTRIBUTES_MEDIA = AudioAttributes.Builder()
             .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -938,16 +902,16 @@ class DolbyRepository(private val context: Context) : AutoCloseable {
         
         private val BASS_CURVES = listOf(
             floatArrayOf(
-                1.00f, 1.00f, 0.95f, 0.90f, 0.80f, 0.70f, 0.55f, 0.40f, 0.25f, 0.15f,
+                0.80f, 0.80f, 0.75f, 0.70f, 0.60f, 0.50f, 0.40f, 0.30f, 0.20f, 0.12f,
                 0.00f, 0.00f, 0.00f, 0.00f, 0.00f, 0.00f, 0.00f, 0.00f, 0.00f, 0.00f
             ),
             floatArrayOf(
-                1.20f, 1.15f, 1.05f, 0.90f, 0.70f, 0.55f, 0.40f, 0.25f, 0.10f, 0.05f,
+                1.00f, 0.95f, 0.85f, 0.70f, 0.55f, 0.40f, 0.30f, 0.20f, 0.12f, 0.08f,
                 0.00f, 0.00f, 0.00f, 0.00f, 0.00f, 0.00f, 0.00f, 0.00f, 0.00f, 0.00f
             ),
             floatArrayOf(
-                0.90f, 0.95f, 1.00f, 1.00f, 0.90f, 0.75f, 0.60f, 0.45f, 0.30f, 0.20f,
-                0.10f, 0.05f, 0.00f, 0.00f, 0.00f, 0.00f, 0.00f, 0.00f, 0.00f, 0.00f
+                0.70f, 0.75f, 0.80f, 0.80f, 0.70f, 0.60f, 0.45f, 0.35f, 0.25f, 0.18f,
+                0.08f, 0.04f, 0.00f, 0.00f, 0.00f, 0.00f, 0.00f, 0.00f, 0.00f, 0.00f
             )
         )
     }
