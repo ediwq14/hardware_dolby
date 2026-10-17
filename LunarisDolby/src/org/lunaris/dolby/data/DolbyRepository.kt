@@ -149,9 +149,11 @@ class DolbyRepository(private val context: Context) : AutoCloseable {
 
     private fun checkIsOnSpeaker(): Boolean {
         return try {
-            val device = audioManager.getDevicesForAttributes(ATTRIBUTES_MEDIA).firstOrNull()
-                ?: return false
-            device.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+            ATTRIBUTES_MEDIA_USAGES.any { usage ->
+                val attributes = AudioAttributes.Builder().setUsage(usage).build()
+                audioManager.getDevicesForAttributes(attributes).firstOrNull()
+                    ?.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+            }
         } catch (e: Exception) {
             DolbyConstants.dlog(TAG, "Error checking speaker state: ${e.message}")
             false
@@ -881,9 +883,16 @@ class DolbyRepository(private val context: Context) : AutoCloseable {
         private const val MID_GAIN_MULTIPLIER = 1.1f
         private const val TREBLE_GAIN_MULTIPLIER = 1.3f
         
-        private val ATTRIBUTES_MEDIA = AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_MEDIA)
-            .build()
+        private val ATTRIBUTES_MEDIA_USAGES = listOf(
+            AudioAttributes.USAGE_MEDIA,
+            AudioAttributes.USAGE_GAME,
+            AudioAttributes.USAGE_VIDEO,
+            AudioAttributes.USAGE_VOICE_COMMUNICATION,
+            AudioAttributes.USAGE_NOTIFICATION,
+            AudioAttributes.USAGE_ALARM,
+            AudioAttributes.USAGE_RINGTONE,
+            AudioAttributes.USAGE_SYSTEM
+        )
 
         val BAND_FREQUENCIES_10 = listOf(32, 64, 125, 250, 500, 1000, 2250, 5000, 10000, 19688)
         

@@ -52,9 +52,9 @@ PRODUCT_VENDOR_PROPERTIES += \
     vendor.audio.dolby.ds2.enabled=false \
     vendor.audio.dolby.ds2.hardbypass=false
 
-# LunarisDolby
+# CrDroidDolby
 PRODUCT_PACKAGES += \
-    LunarisDolby
+    CrDroidDolby
 
 # Init
 PRODUCT_PACKAGES += \
